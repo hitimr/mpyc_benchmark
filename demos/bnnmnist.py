@@ -55,9 +55,33 @@ import gzip
 import numpy as np
 from mpyc.runtime import mpc
 import mpyc.gmpy as gmpy2
+import psutil
+import time
 
 secint = None
+ 
+def get_process_memory():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return mem_info.rss/1024/1024
 
+
+def check_mem(max_mem):
+    current_mem = get_process_memory()
+    if(max_mem < current_mem):
+        max_mem = current_mem
+    return max_mem
+
+def init_mem_file(fileName):
+    try:
+        os.remove(fileName)
+    except:
+        pass
+
+def write_mem(fileName, max_mem, time, party_size):
+    f = open(fileName, "a")
+    f.write(f"{party_size}\tpid {mpc.pid}\t{max_mem}\t{time}\n")
+    f.close()
 
 def load_W(name):
     """Load signed binary weights for fully connected layer 'name'."""
@@ -282,6 +306,9 @@ async def vector_sge(x):
 
 
 async def main():
+    max_mem = 0
+    
+    
     global secint
 
     parser = argparse.ArgumentParser()
@@ -295,9 +322,13 @@ async def main():
                         default=False, help='disable Legendre-based comparison')
     parser.add_argument('--no-vectorization', action='store_true',
                         default=False, help='disable vectorization of comparisons')
+
     parser.set_defaults(batch_size=1, offset=-1, d_k_star=1)
     args = parser.parse_args()
 
+    party_size = len(mpc.parties)
+    mem_file_name = f"memory_{party_size}.txt"    
+    init_mem_file(mem_file_name)
     batch_size = args.batch_size
     offset = args.offset
     if args.no_legendre:
@@ -324,7 +355,11 @@ async def main():
         offset = random.randrange(10001 - batch_size) if mpc.pid == 0 else None
         offset = await mpc.transfer(offset, senders=0)
 
+    
+
+    start_time = time.time()
     logging.info('--------------- INPUT   -------------')
+    max_mem=check_mem(max_mem)
     print(f'Type = {secint.__name__}, range = ({offset}, {offset + batch_size})')
     # read batch_size labels and images at given offset
     df = gzip.open(os.path.join('data', 'cnn', 't10k-labels-idx1-ubyte.gz'))
@@ -332,6 +367,7 @@ async def main():
     labels = list(map(int, d))
     print('Labels:', labels)
     df = gzip.open(os.path.join('data', 'cnn', 't10k-images-idx3-ubyte.gz'))
+    max_mem=check_mem(max_mem)
     d = df.read()[16 + offset * 28**2: 16 + (offset + batch_size) * 28**2]
     L = np.array(list(d)).reshape(batch_size, 28**2)
     if batch_size == 1:
@@ -339,11 +375,15 @@ async def main():
         print(np.array2string(np.vectorize(lambda a: int(bool((a/255))))(x), separator=''))
 
     L = np.vectorize(lambda a: secint(int(a)))(L).tolist()
+    max_mem=check_mem(max_mem)
 
     logging.info('--------------- LAYER 1 -------------')
     logging.info('- - - - - - - - fc      - - - - - - -')
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_prod(L, load_W('fc1'))
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_add(L, [load_b('fc1')] * len(L))
+    max_mem=check_mem(max_mem)
     logging.info('- - - - - - - - bsgn    - - - - - - -')
     if one_by_one:
         L = np.vectorize(lambda a: (a >= 0) * 2 - 1)(L).tolist()
@@ -353,8 +393,11 @@ async def main():
 
     logging.info('--------------- LAYER 2 -------------')
     logging.info('- - - - - - - - fc      - - - - - - -')
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_prod(L, load_W('fc2'))
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_add(L, [load_b('fc2')] * len(L))
+    max_mem=check_mem(max_mem)
     await mpc.barrier()
     logging.info('- - - - - - - - bsgn    - - - - - - -')
     if args.no_legendre:
@@ -374,10 +417,14 @@ async def main():
 
     logging.info('--------------- LAYER 3 -------------')
     logging.info('- - - - - - - - fc      - - - - - - -')
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_prod(L, load_W('fc3'))
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_add(L, [load_b('fc3')] * len(L))
+    max_mem=check_mem(max_mem)
     await mpc.barrier()
     logging.info('- - - - - - - - bsgn    - - - - - - -')
+    max_mem=check_mem(max_mem)
     if args.no_legendre:
         secint.bit_length = 10
         if one_by_one:
@@ -395,19 +442,28 @@ async def main():
 
     logging.info('--------------- LAYER 4 -------------')
     logging.info('- - - - - - - - fc      - - - - - - -')
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_prod(L, load_W('fc4'))
+    max_mem=check_mem(max_mem)
     L = mpc.matrix_add(L, [load_b('fc4')] * len(L))
+    max_mem=check_mem(max_mem)
+    end_time = time.time()
+    write_mem(mem_file_name, max_mem, end_time - start_time, party_size)
     await mpc.barrier()
 
-    logging.info('--------------- OUTPUT  -------------')
-    if args.no_legendre:
-        secint.bit_length = 14
-    for i in range(batch_size):
-        prediction = await mpc.output(mpc.argmax(L[i])[0])
-        error = '******* ERROR *******' if prediction != labels[i] else ''
-        print(f'Image #{offset+i} with label {labels[i]}: {prediction} predicted. {error}')
-        print(await mpc.output(L[i]))
-
+    if False:
+        logging.info('--------------- OUTPUT  -------------')
+        if args.no_legendre:
+            secint.bit_length = 14
+            check_mem()
+        for i in range(batch_size):
+            prediction = await mpc.output(mpc.argmax(L[i])[0])
+            max_mem=check_mem(max_mem)
+            error = '******* ERROR *******' if prediction != labels[i] else ''
+            print(f'Image #{offset+i} with label {labels[i]}: {prediction} predicted. {error}')
+            print(await mpc.output(L[i]))
+        max_mem=check_mem(max_mem)    
+    
     await mpc.shutdown()
 
 if __name__ == '__main__':
